@@ -22,6 +22,14 @@ The server exposes ONLY three tools, deliberately append-only + read-only:
 No delete, no shell, no file access outside the jobs/ folder, no secrets.
 It runs on Streamable HTTP at /mcp so ChatGPT web plugins can reach it.
 
+Claude connects to the SAME server (same URL): its custom-connector
+dialog needs minimal OAuth 2.0 (dynamic registration + authorization
+code), so this server also exposes the /.well-known/oauth-* discovery
+endpoints and /oauth/register, /oauth/authorize, /oauth/approve,
+/oauth/token — the same minimal test-OAuth pattern as the Oct 25 bridge,
+which Claude accepted. ChatGPT uses "No authentication" and never
+touches those endpoints. A token unlocks only queueing a video job.
+
 Config (env vars):
     FIREBASE_API_KEY      Firebase web API key (already public in his apps)
     FIREBASE_PROJECT_ID   Firebase project id (streamflix-7d2ee)
@@ -30,17 +38,21 @@ Without the Firebase vars the server falls back to local JSON files in
 jobs/ (handy for offline testing — NOT durable, do not use in production).
 """
 
+import html
 import json
 import os
 import re
+import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 import httpx
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 BASE = Path(__file__).resolve().parent
 JOBS = BASE / "jobs"
@@ -234,6 +246,196 @@ async def health(request: Request):
     return JSONResponse(
         {"ok": True, "service": "sheraz-video-bridge", "backend": type(BACKEND).__name__}
     )
+
+
+# ------------------------------------------------------------------- OAuth
+# Minimal OAuth 2.0 for Claude's custom-connector dialog (same pattern as
+# the Oct 25 bridge, which Claude accepted). Claude's dialog does dynamic
+# client registration, then an authorization-code flow. Without these
+# endpoints it fails with "Couldn't register with ... sign-in service".
+# This is NOT production OAuth: the approve page has no login. The only
+# thing a token unlocks is queueing a video job (append-only), and the
+# Render URL itself is the protection. A stable production deployment
+# must add a real login before approve.
+OAUTH_CLIENTS = {}   # client_id -> {"client_secret": str, "redirect_uris": [str]}
+OAUTH_CODES = {}     # code -> {"client_id": str, "redirect_uri": str, "expires": float}
+OAUTH_TOKENS = {}    # access_token -> {"client_id": str, "expires": float}
+OAUTH_REFRESH = {}   # refresh_token -> {"client_id": str}
+
+
+def _oauth_base(request: Request) -> str:
+    host = request.headers.get("host", f"127.0.0.1:{PORT}")
+    proto = request.headers.get("x-forwarded-proto", "")
+    if proto:
+        scheme = proto.split(",")[0].strip()
+    elif host.startswith("127.0.0.1") or host.startswith("localhost"):
+        scheme = "http"
+    else:
+        scheme = "https"
+    return f"{scheme}://{host}"
+
+
+def _oauth_server_meta(request: Request):
+    base = _oauth_base(request)
+    return {
+        "issuer": base,
+        "authorization_endpoint": base + "/oauth/authorize",
+        "token_endpoint": base + "/oauth/token",
+        "registration_endpoint": base + "/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
+    }
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+@mcp.custom_route("/.well-known/oauth-authorization-server/mcp", methods=["GET"])
+@mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+async def _oauth_discovery(request: Request):
+    return JSONResponse(_oauth_server_meta(request))
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+@mcp.custom_route("/.well-known/oauth-protected-resource/mcp", methods=["GET"])
+async def _oauth_protected_resource(request: Request):
+    base = _oauth_base(request)
+    return JSONResponse({
+        "resource": base + "/mcp",
+        "authorization_servers": [base],
+        "scopes_supported": ["video"],
+    })
+
+
+@mcp.custom_route("/oauth/authorize", methods=["GET"])
+async def _oauth_authorize(request: Request):
+    q = request.query_params
+    client_id = q.get("client_id", "")
+    redirect_uri = q.get("redirect_uri", "")
+    state = q.get("state", "")
+    if not client_id or not redirect_uri:
+        return HTMLResponse(
+            "<html><head><title>Muse Video Bridge</title></head><body>"
+            "<h2>Is page ko seedha mat kholo</h2>"
+            "<p>Ye Approve page sirf Claude ke connector se khulne par "
+            "kaam karta hai. Seedha kholne par is me client aur redirect ki "
+            "maloomat nahi hoti, is liye Approve dabane se kuch nahi hoga.</p>"
+            "<p>Sahi tareeqa: Claude me connector par Connect dabao, "
+            "jo Approve page wo khole, us me Approve dabao. Wo tumhe khud wapas "
+            "Claude par le jayega.</p></body></html>",
+            status_code=400,
+        )
+    code_challenge = q.get("code_challenge", "")
+    method = q.get("code_challenge_method", "plain")
+    esc = html.escape
+    body = (
+        "<html><head><title>Muse Video Bridge</title></head><body>"
+        "<h2>Muse Video Bridge</h2>"
+        "<p>Claude is asking to connect to your Muse video queue "
+        "(submit and check video jobs only). Click Approve to connect.</p>"
+        "<form method='post' action='/oauth/approve'>"
+        f"<input type='hidden' name='client_id' value='{esc(client_id)}'>"
+        f"<input type='hidden' name='redirect_uri' value='{esc(redirect_uri)}'>"
+        f"<input type='hidden' name='state' value='{esc(state)}'>"
+        f"<input type='hidden' name='code_challenge' value='{esc(code_challenge)}'>"
+        f"<input type='hidden' name='code_challenge_method' value='{esc(method)}'>"
+        "<button type='submit'>Approve</button></form>"
+        "<p><b>TEST OAUTH ONLY — no login on this page.</b> Do not run "
+        "this server as a stable public service in this state.</p></body></html>"
+    )
+    return HTMLResponse(body)
+
+
+@mcp.custom_route("/oauth/register", methods=["POST"])
+@mcp.custom_route("/register", methods=["POST"])
+async def _oauth_register(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    client_id = "muse-" + secrets.token_hex(8)
+    client_secret = secrets.token_urlsafe(32)
+    redirect_uris = body.get("redirect_uris") or []
+    OAUTH_CLIENTS[client_id] = {
+        "client_secret": client_secret,
+        "redirect_uris": redirect_uris,
+    }
+    return JSONResponse({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_secret_expires_at": 0,
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }, status_code=201)
+
+
+@mcp.custom_route("/oauth/approve", methods=["POST"])
+async def _oauth_approve(request: Request):
+    form = await request.form()
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    state = form.get("state", "")
+    if not redirect_uri:
+        return HTMLResponse(
+            "<html><head><title>Muse Video Bridge</title></head><body>"
+            "<h2>Approve nahi ho saka</h2>"
+            "<p>Redirect ki maloomat missing hai. Ye page seedha khola gaya hai, "
+            "Claude ke connector se nahi. Koi code issue nahi hua.</p>"
+            "<p>Claude me wapas jao, connector par Connect dabao, "
+            "aur jo Approve page wo khole us me Approve dabao.</p></body></html>",
+            status_code=400,
+        )
+    code = secrets.token_urlsafe(32)
+    OAUTH_CODES[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "expires": time.time() + 600,
+    }
+    params = {"code": code}
+    if state:
+        params["state"] = state
+    location = redirect_uri + ("&" if "?" in redirect_uri else "?") + urlencode(params)
+    return RedirectResponse(location, status_code=302)
+
+
+@mcp.custom_route("/oauth/token", methods=["POST"])
+async def _oauth_token(request: Request):
+    form = await request.form()
+    grant = form.get("grant_type", "")
+    if grant == "authorization_code":
+        code = form.get("code", "")
+        rec = OAUTH_CODES.pop(code, None)
+        if not rec or rec["expires"] < time.time():
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        access = secrets.token_urlsafe(32)
+        refresh = secrets.token_urlsafe(32)
+        OAUTH_TOKENS[access] = {"client_id": rec["client_id"], "expires": time.time() + 3600}
+        OAUTH_REFRESH[refresh] = {"client_id": rec["client_id"]}
+        return JSONResponse({
+            "access_token": access,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": refresh,
+            "scope": "video",
+        })
+    if grant == "refresh_token":
+        refresh = form.get("refresh_token", "")
+        rec = OAUTH_REFRESH.get(refresh)
+        if not rec:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        access = secrets.token_urlsafe(32)
+        OAUTH_TOKENS[access] = {"client_id": rec["client_id"], "expires": time.time() + 3600}
+        return JSONResponse({
+            "access_token": access,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "video",
+        })
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
 if __name__ == "__main__":

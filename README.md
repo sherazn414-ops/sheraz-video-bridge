@@ -1,7 +1,7 @@
-# Sheraz Video Bridge — MCP server for ChatGPT
+# Sheraz Video Bridge — MCP server for ChatGPT and Claude
 
-**Kaam:** GPT script likhta hai, Muse video banata hai. Ye server dono ke
-beech ka bridge hai.
+**Kaam:** GPT ya Claude script likhta hai, Muse video banata hai. Ye server
+dono ke beech ka bridge hai.
 
 ## Workflow
 
@@ -60,6 +60,19 @@ does not have this problem.
 4. Connection → Server URL: `<tunnel URL>/mcp`
 5. Authentication: **No authentication**
 6. Risk warning par **I understand and want to continue** → **Create as a plugin**
+
+## Claude mein connect karna
+
+Claude ko OAuth chahiye, is liye server mein minimal OAuth 2.0 hai
+(`/.well-known/oauth-*` discovery, `/oauth/register`, `/oauth/authorize`,
+`/oauth/approve`, `/oauth/token` — Oct 25 wale bridge ka tested pattern).
+
+1. Claude → Settings → Connectors → Add custom connector
+2. Name: `Muse Video Bridge`
+3. MCP server URL: `https://sheraz-video-bridge.onrender.com/mcp`
+4. Connect → Approve page par Approve dabao (ye page Claude khole)
+5. Tools mein `submit_script`, `list_jobs`, `job_status` nazar aayenge —
+   Claude `submit_script` se script trigger karega, Muse video banayega.
 
 ## Security notes
 
