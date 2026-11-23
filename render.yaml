@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: sheraz-video-bridge
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: FIREBASE_API_KEY
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        value: streamflix-7d2ee
